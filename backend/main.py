@@ -67,12 +67,18 @@ def extract_all_text_from_pdf(pdf_content: bytes) -> str:
 
 def extract_number_from_text(text: str) -> float:
     """Extract a clean number from text, handling commas and decimals"""
-    # Find all number patterns (handles 1,150.00 format)
-    matches = re.findall(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)', text)
+    # First, handle cases where space is used as thousands separator (common in some regions)
+    # Convert "1 150.00" to "1150.00"
+    cleaned_text = re.sub(r'(\d+)\s+(\d{3})(?:\.\d{2})?', r'\1\2', text)
+    
+    # Find all number patterns (handles 1,150.00 and 1150.00 format)
+    matches = re.findall(r'(\d{1,3}(?:(?:,|\s)\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)', text)
+    
     if matches:
         # Take the last match (usually the value)
         value_str = matches[-1]
-        cleaned = value_str.replace(',', '')
+        # Remove commas and spaces
+        cleaned = value_str.replace(',', '').replace(' ', '')
         try:
             return float(cleaned)
         except:
