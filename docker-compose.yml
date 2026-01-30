@@ -22,6 +22,7 @@ services:
       - .env
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
     networks:
       - sales-network
     depends_on:

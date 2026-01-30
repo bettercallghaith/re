@@ -26,6 +26,7 @@ app.add_middleware(
 )
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/generate"
 
 
@@ -35,7 +36,7 @@ async def call_llm(prompt: str, system_prompt: str = "") -> str:
     
     async with aiohttp.ClientSession() as session:
         payload = {
-            "model": "mistral",
+            "model": OLLAMA_MODEL,
             "prompt": full_prompt,
             "stream": False,
             "options": {
