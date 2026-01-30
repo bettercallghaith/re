@@ -1,250 +1,254 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+"""
+Sales Analytics API - LLM-Powered PDF Extraction
+Uses Ollama (Mistral) to intelligently extract and analyze sales data from ANY PDF format.
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
+from datetime import datetime
+from typing import Dict, List, Any, Optional
 import pdfplumber
-import re
+import pandas as pd
+import aiohttp
 import io
 import os
-import aiohttp
-from typing import List, Dict, Any
-from datetime import datetime
+import re
+import json
 
-app = FastAPI(title="Sales Analyzer API")
+app = FastAPI(title="Sales Analytics API")
 
-# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/api/generate"
-
-# Telegram configuration (from environment)
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_URL = f"{OLLAMA_HOST}/api/generate"
 
 
-async def send_pdf_to_telegram(pdf_content: bytes, filename: str):
-    """Send PDF file to Telegram chat"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        
-        data = aiohttp.FormData()
-        data.add_field('chat_id', TELEGRAM_CHAT_ID)
-        data.add_field('document', pdf_content, filename=filename, content_type='application/pdf')
-        data.add_field('caption', f"📊 New sales report uploaded: {filename}\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                if response.status == 200:
-                    print(f"PDF sent to Telegram successfully: {filename}")
-                else:
-                    error = await response.text()
-                    print(f"Telegram send failed: {error}")
-    except Exception as e:
-        print(f"Telegram error: {e}")
-
-
-async def analyze_with_llm(prompt: str) -> str:
-    """Call local Ollama LLM for analysis"""
+async def call_llm(prompt: str, system_prompt: str = "") -> str:
+    """Call Ollama LLM with a prompt"""
+    full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+    
     async with aiohttp.ClientSession() as session:
         payload = {
             "model": "mistral",
-            "prompt": prompt,
-            "stream": False
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1,  # Low temp for accuracy
+                "num_predict": 4000
+            }
         }
         try:
-            async with session.post(OLLAMA_URL, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            async with session.post(OLLAMA_URL, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as response:
                 if response.status == 200:
                     result = await response.json()
                     return result.get("response", "")
-                return await generate_rule_based_insights(prompt)
+                return ""
         except Exception as e:
-            print(f"LLM unavailable: {e}")
-            return await generate_rule_based_insights(prompt)
+            print(f"LLM call failed: {e}")
+            return ""
 
 
-async def generate_rule_based_insights(context: str) -> str:
-    """Fallback rule-based analysis when LLM is unavailable"""
-    insights = []
+def extract_all_text_from_pdf(pdf_content: bytes) -> str:
+    """Extract all text from PDF including tables"""
+    all_text = []
     
-    # Parse metrics from context
-    if "Total Sales:" in context:
-        insights.append("📈 Strong sales performance detected. Monitor daily trends for consistency.")
-    if "cancel" in context.lower():
-        insights.append("⚠️ Review cancellation patterns to identify potential issues in order fulfillment.")
-    if "area" in context.lower():
-        insights.append("🗺️ Geographic analysis suggests focusing marketing on top-performing areas.")
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            page_text = f"\n--- PAGE {i+1} ---\n"
+            
+            # Extract text
+            text = page.extract_text() or ""
+            page_text += text + "\n"
+            
+            # Extract tables
+            tables = page.extract_tables()
+            for table_idx, table in enumerate(tables):
+                if table:
+                    page_text += f"\n[TABLE {table_idx+1}]\n"
+                    for row in table:
+                        if row:
+                            row_text = " | ".join(str(cell or "") for cell in row)
+                            page_text += row_text + "\n"
+            
+            all_text.append(page_text)
     
-    insights.append("💡 Consider implementing customer loyalty programs for repeat purchases.")
-    
-    return "\n".join(insights)
+    return "\n".join(all_text)
 
 
-def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
-    """Extract summary values (TOTAL ORDERS, DELIVERY CHARGE, REFUND, RETURN, CANCEL) from PDF"""
-    summary = {
-        'total_orders_value': 0.0,
-        'cash': 0.0,
-        'bank': 0.0,
-        'delivery_charge': 0.0,
-        'pending': 0.0,
-        'refund': 0.0,
-        'return': 0.0,
-        'cancel': 0.0
-    }
+def extract_json_from_response(response: str) -> dict:
+    """Extract JSON from LLM response"""
+    # Try to find JSON in the response
+    json_patterns = [
+        r'```json\s*([\s\S]*?)\s*```',
+        r'```\s*([\s\S]*?)\s*```',
+        r'\{[\s\S]*\}'
+    ]
     
-    keywords_map = {
-        'total orders': 'total_orders_value',
-        'cash': 'cash',
-        'bank': 'bank',
-        'delivery charge': 'delivery_charge',
-        'pending': 'pending',
-        'refund': 'refund',
-        'return': 'return',
-        'cancel': 'cancel'
-    }
-    
-    def extract_number_from_text(text: str) -> float:
-        """Extract a clean number from text, handling commas and decimals"""
-        # Find all number patterns (handles 1,150.00 format)
-        # Pattern matches: optional digits, optional comma+digits groups, optional decimal
-        matches = re.findall(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)', text)
+    for pattern in json_patterns:
+        matches = re.findall(pattern, response, re.DOTALL)
         if matches:
-            # Take the last match (usually the value on the right side)
-            value_str = matches[-1]
-            # Remove commas and convert to float
-            cleaned = value_str.replace(',', '')
+            for match in matches:
+                try:
+                    # Clean the match
+                    cleaned = match.strip()
+                    if not cleaned.startswith('{'):
+                        continue
+                    return json.loads(cleaned)
+                except:
+                    continue
+    
+    return {}
+
+
+async def extract_summary_with_llm(pdf_text: str) -> Dict[str, Any]:
+    """Use LLM to extract summary data from PDF"""
+    
+    system_prompt = """You are a data extraction expert. Extract financial data from sales reports with 100% accuracy.
+Your task is to find and extract specific values from the text.
+CRITICAL: Extract the EXACT numbers as they appear. Do not calculate or modify them.
+Return ONLY valid JSON, no other text."""
+
+    prompt = f"""Analyze this sales report and extract the financial summary data.
+
+REPORT TEXT:
+{pdf_text[:15000]}  # Limit to avoid token issues
+
+Extract and return this JSON structure (use 0 if not found):
+```json
+{{
+    "total_orders_value": <number - find "TOTAL ORDERS" value>,
+    "cash": <number - find "CASH" value>,
+    "bank": <number - find "BANK" value>,
+    "delivery_charge": <number - find "DELIVERY CHARGE" value>,
+    "pending": <number - find "PENDING" value>,
+    "refund": <number - find "REFUND" value>,
+    "return": <number - find "RETURN" value>,
+    "cancel": <number - find "CANCEL" value>
+}}
+```
+
+Remember: Extract exact values like 183,600.00 → 183600, 1,150.00 → 1150
+Return ONLY the JSON:"""
+
+    response = await call_llm(prompt, system_prompt)
+    data = extract_json_from_response(response)
+    
+    # Provide defaults
+    defaults = {
+        'total_orders_value': 0,
+        'cash': 0,
+        'bank': 0,
+        'delivery_charge': 0,
+        'pending': 0,
+        'refund': 0,
+        'return': 0,
+        'cancel': 0
+    }
+    
+    for key in defaults:
+        if key not in data:
+            data[key] = defaults[key]
+        else:
+            # Ensure it's a number
             try:
-                return float(cleaned)
+                data[key] = float(str(data[key]).replace(',', ''))
             except:
-                return 0.0
-        return 0.0
+                data[key] = 0
     
-    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
-        # Process ALL pages
-        for page in pdf.pages:
-            text = page.extract_text() or ''
-            lines = text.split('\n')
-            
-            for line in lines:
-                line_lower = line.lower().strip()
-                for keyword, key in keywords_map.items():
-                    if keyword in line_lower:
-                        value = extract_number_from_text(line)
-                        if value > 0:
-                            summary[key] = value
-            
-            # Also try extracting from tables (more reliable)
-            tables = page.extract_tables()
-            for table in tables:
-                if not table:
-                    continue
-                for row in table:
-                    if not row or len(row) < 2:
-                        continue
-                    cell_text = str(row[0] or '').lower().strip()
-                    for keyword, key in keywords_map.items():
-                        if keyword in cell_text:
-                            # Get value from second column
-                            value_text = str(row[1] or '')
-                            value = extract_number_from_text(value_text)
-                            if value > 0:
-                                summary[key] = value
-    
-    return summary
+    return data
 
 
-def extract_sales_data(pdf_content: bytes) -> List[Dict[str, Any]]:
-    """Extract sales data from PDF using pdfplumber"""
-    orders = []
+async def extract_orders_with_llm(pdf_text: str) -> List[Dict[str, Any]]:
+    """Use LLM to extract individual orders from PDF"""
     
-    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
-        for page in pdf.pages:
-            # Extract tables from each page
-            tables = page.extract_tables()
-            
-            for table in tables:
-                if not table:
-                    continue
-                    
-                # Skip header row if detected
-                start_row = 0
-                if table[0] and any(h and 'date' in str(h).lower() for h in table[0]):
-                    start_row = 1
-                
-                for row in table[start_row:]:
-                    if not row or len(row) < 4:
-                        continue
-                    
-                    # Try to parse as order data
-                    try:
-                        # Clean and extract values
-                        date_val = str(row[0] or '').strip()
-                        
-                        # Skip if doesn't look like a date
-                        if not re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', date_val):
-                            continue
-                        
-                        order = {
-                            'date': date_val,
-                            'order_no': str(row[1] or '').strip() if len(row) > 1 else '',
-                            'area': str(row[2] or '').strip() if len(row) > 2 else '',
-                            'customer_no': str(row[3] or '').strip() if len(row) > 3 else '',
-                            'product': str(row[4] or '').strip() if len(row) > 4 else '',
-                            'unit_price': str(row[5] or '').strip() if len(row) > 5 else '',
-                            'quantity': str(row[6] or '1').strip() if len(row) > 6 else '1',
-                            'payment': str(row[7] or '').strip() if len(row) > 7 else '',
-                            'status': str(row[8] or 'COMPLETED').strip() if len(row) > 8 else 'COMPLETED'
-                        }
-                        orders.append(order)
-                    except Exception:
-                        continue
-            
-            # Also try text extraction for non-tabular data
-            text = page.extract_text() or ''
-            lines = text.split('\n')
-            
-            for line in lines:
-                if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', line.strip()[:12]):
-                    parts = re.split(r'\s{2,}', line.strip())
-                    if len(parts) >= 5:
-                        order = {
-                            'date': parts[0],
-                            'order_no': parts[1] if len(parts) > 1 else '',
-                            'area': parts[2] if len(parts) > 2 else '',
-                            'customer_no': parts[3] if len(parts) > 3 else '',
-                            'product': parts[4] if len(parts) > 4 else '',
-                            'unit_price': parts[5] if len(parts) > 5 else '',
-                            'quantity': parts[6] if len(parts) > 6 else '1',
-                            'payment': parts[7] if len(parts) > 7 else '',
-                            'status': parts[8] if len(parts) > 8 else 'COMPLETED'
-                        }
-                        # Avoid duplicates
-                        if order['order_no'] and not any(o['order_no'] == order['order_no'] for o in orders):
-                            orders.append(order)
+    system_prompt = """You are a data extraction expert. Extract sales order data from reports.
+Each order has: date, order number, area/location, customer phone, product name, price, and status.
+Return valid JSON array only."""
+
+    prompt = f"""Extract the individual sales orders from this report.
+
+REPORT TEXT:
+{pdf_text[:20000]}
+
+Extract and return a JSON array of orders. Each order should have:
+- date: DD/MM/YYYY format
+- order_no: order number
+- area: location/area name
+- customer_no: customer phone number
+- product: product name
+- unit_price: price as number (183600.00 → 183600)
+- status: order status (e.g., PENDING, CASH, CANCELLED, etc.)
+
+Return ONLY the JSON array:
+```json
+[
+    {{
+        "date": "28/01/2026",
+        "order_no": "12345",
+        "area": "Qatar",
+        "customer_no": "97455060363",
+        "product": "Product Name",
+        "unit_price": 1500,
+        "status": "PENDING"
+    }}
+]
+```"""
+
+    response = await call_llm(prompt, system_prompt)
+    data = extract_json_from_response(response)
     
-    return orders
+    # Handle if it's a dict with an array inside
+    if isinstance(data, dict):
+        for key in ['orders', 'data', 'items']:
+            if key in data and isinstance(data[key], list):
+                return data[key]
+        return []
+    
+    if isinstance(data, list):
+        return data
+    
+    return []
 
 
-def parse_currency(value: str) -> float:
-    """Parse currency string to float"""
-    if not value:
-        return 0.0
-    # Remove currency symbols and whitespace
-    cleaned = re.sub(r'[^\d.,\-]', '', str(value))
-    # Remove commas (thousands separator)
-    cleaned = cleaned.replace(',', '')
-    # Handle .000 at the end (strip trailing zeros after decimal)
-    try:
-        result = float(cleaned) if cleaned else 0.0
-        # If value has decimal that ends in zeros, it's the actual decimal value
-        return result
-    except ValueError:
-        return 0.0
+async def generate_insights_with_llm(summary: Dict, orders_count: int, top_products: List[str], top_areas: List[str]) -> str:
+    """Generate AI insights about the sales data"""
+    
+    system_prompt = """You are a Qatar retail business analyst. Provide exactly 4 concise, actionable insights based on the sales data.
+Each insight must be 1-2 sentences maximum. Start each with an emoji."""
+
+    prompt = f"""Analyze this Qatar sales report and provide 4 business insights:
+
+Data:
+- Total Sales: QAR {summary.get('total_orders_value', 0):,.0f}
+- Cash Sales: QAR {summary.get('cash', 0):,.0f}
+- Bank Sales: QAR {summary.get('bank', 0):,.0f}
+- Delivery Charges: QAR {summary.get('delivery_charge', 0):,.0f}
+- Pending Orders: QAR {summary.get('pending', 0):,.0f}
+- Refunds: QAR {summary.get('refund', 0):,.0f}
+- Returns: QAR {summary.get('return', 0):,.0f}
+- Cancelled: QAR {summary.get('cancel', 0):,.0f}
+- Number of Orders: {orders_count}
+- Top Products: {', '.join(top_products[:5])}
+- Top Areas: {', '.join(top_areas[:3])}
+
+Provide 4 bullet points starting with emojis (📈, ⚠️, 🗺️, 💡):"""
+
+    response = await call_llm(prompt, system_prompt)
+    
+    if not response:
+        # Fallback insights
+        return """📈 Sales data analyzed. Monitor daily trends for consistency.
+⚠️ Review refunds and cancellations to identify issues.
+🗺️ Focus marketing efforts on top-performing areas.
+💡 Consider loyalty programs to increase repeat purchases."""
+    
+    return response
 
 
 @app.get("/api/health")
@@ -255,116 +259,109 @@ async def health_check():
 
 @app.post("/api/analyze")
 async def analyze_sales(file: UploadFile = File(...)):
-    """Analyze uploaded sales report PDF"""
+    """Analyze uploaded sales report PDF using LLM"""
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
     
     content = await file.read()
     
-    # Send PDF to Telegram (async, non-blocking)
-    import asyncio
-    asyncio.create_task(send_pdf_to_telegram(content, file.filename or "sales_report.pdf"))
+    # Extract text from PDF
+    pdf_text = extract_all_text_from_pdf(content)
     
-    # Extract summary values from PDF (TOTAL ORDERS, DELIVERY CHARGE, REFUND, RETURN, CANCEL)
-    pdf_summary = extract_summary_from_pdf(content)
+    if not pdf_text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
     
-    # Extract order data from PDF
-    orders = extract_sales_data(content)
+    # Use LLM to extract summary data
+    summary_data = await extract_summary_with_llm(pdf_text)
+    
+    # Use LLM to extract individual orders
+    orders = await extract_orders_with_llm(pdf_text)
     
     if not orders:
-        raise HTTPException(status_code=400, detail="Could not extract any order data from PDF")
+        # Fallback: try regex-based extraction
+        orders = extract_orders_fallback(content)
     
     # Convert to DataFrame for analysis
-    df = pd.DataFrame(orders)
+    df = pd.DataFrame(orders) if orders else pd.DataFrame()
     
-    # Parse numeric columns
-    df['unit_price_num'] = df['unit_price'].apply(parse_currency)
-    df['payment_num'] = df['payment'].apply(parse_currency)
+    # Calculate values
+    total_sales = summary_data.get('total_orders_value', 0)
+    delivery_charge = summary_data.get('delivery_charge', 0)
+    refund_amount = summary_data.get('refund', 0)
+    return_amount = summary_data.get('return', 0)
+    cancel_amount = summary_data.get('cancel', 0)
+    pending_amount = summary_data.get('pending', 0)
     
-    # Calculate revenue - use payment if available, else unit_price
-    df['revenue'] = df.apply(
-        lambda r: r['payment_num'] if r['payment_num'] > 0 else r['unit_price_num'],
-        axis=1
-    )
-    
-    # Use PDF summary values if available, otherwise calculate from orders
-    total_sales = pdf_summary['total_orders_value'] if pdf_summary['total_orders_value'] > 0 else df['revenue'].sum()
-    total_orders = len(df)
-    avg_order_value = total_sales / total_orders if total_orders > 0 else 0
-    
-    # Extract actual charges from PDF summary
-    delivery_charge = pdf_summary['delivery_charge']
-    refund_amount = pdf_summary['refund']
-    return_amount = pdf_summary['return']
-    cancel_amount = pdf_summary['cancel']
-    pending_amount = pdf_summary['pending']
-    
-    # Total deductions = Delivery Charge + Refund + Return + Cancel
+    # Calculate profit: Total - (Delivery + Refund + Return + Cancel)
     total_deductions = delivery_charge + refund_amount + return_amount + cancel_amount
-    
-    # Profit = Total Orders Value - Total Deductions
     total_profit = total_sales - total_deductions
     profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else 0
     
-    # Status analysis
-    status_counts = df['status'].value_counts().to_dict()
-    cancelled_orders = sum(v for k, v in status_counts.items() if 'cancel' in k.lower())
+    total_orders = len(orders) if orders else 0
+    avg_order_value = total_sales / total_orders if total_orders > 0 else 0
+    
+    # Analyze orders
+    biggest_orders = []
+    top_customers = {}
+    top_products = {}
+    top_products_revenue = {}
+    area_performance = {}
+    status_counts = {}
+    daily_trend = {}
+    
+    if not df.empty:
+        # Parse unit_price
+        if 'unit_price' in df.columns:
+            df['revenue'] = pd.to_numeric(df['unit_price'], errors='coerce').fillna(0)
+        else:
+            df['revenue'] = 0
+        
+        # Top orders
+        if 'revenue' in df.columns and df['revenue'].sum() > 0:
+            biggest = df.nlargest(5, 'revenue')
+            biggest_orders = biggest[['customer_no', 'product', 'revenue', 'date']].to_dict('records')
+            for order in biggest_orders:
+                order['revenue'] = int(order.get('revenue', 0))
+        
+        # Top customers
+        if 'customer_no' in df.columns and 'revenue' in df.columns:
+            top_customers = df.groupby('customer_no')['revenue'].sum().sort_values(ascending=False).head(10).to_dict()
+            top_customers = {k: int(v) for k, v in top_customers.items()}
+        
+        # Top products by count
+        if 'product' in df.columns:
+            top_products = df['product'].value_counts().head(10).to_dict()
+            # Top products by revenue
+            if 'revenue' in df.columns:
+                top_products_revenue = df.groupby('product')['revenue'].sum().sort_values(ascending=False).head(10).to_dict()
+                top_products_revenue = {k: int(v) for k, v in top_products_revenue.items()}
+        
+        # Area performance
+        if 'area' in df.columns and 'revenue' in df.columns:
+            area_performance = df.groupby('area')['revenue'].sum().sort_values(ascending=False).head(8).to_dict()
+            area_performance = {k: int(v) for k, v in area_performance.items()}
+        
+        # Status counts
+        if 'status' in df.columns:
+            status_counts = df['status'].value_counts().to_dict()
+        
+        # Daily trend
+        if 'date' in df.columns and 'revenue' in df.columns:
+            df['parsed_date'] = pd.to_datetime(df['date'], format='%d/%m/%Y', errors='coerce')
+            daily = df.groupby(df['parsed_date'].dt.strftime('%Y-%m-%d'))['revenue'].sum()
+            daily_trend = {k: int(v) for k, v in daily.to_dict().items() if k and k != 'NaT'}
+    
+    # Count cancelled orders
+    cancelled_orders = sum(v for k, v in status_counts.items() if 'cancel' in str(k).lower())
     successful_orders = total_orders - cancelled_orders
     
-    # Biggest orders by customer/phone
-    biggest_orders = df.nlargest(5, 'revenue')[['customer_no', 'product', 'revenue', 'date']].to_dict('records')
-    
-    # Top customers by total spend
-    top_customers = df.groupby('customer_no')['revenue'].sum().sort_values(ascending=False).head(10).to_dict()
-    
-    # Top products by order count
-    top_products_count = df['product'].value_counts().head(10).to_dict()
-    
-    # Top products by revenue
-    top_products_revenue = df.groupby('product')['revenue'].sum().sort_values(ascending=False).head(10).to_dict()
-    
-    # Area performance
-    area_performance = df.groupby('area')['revenue'].sum().sort_values(ascending=False).head(8).to_dict()
-    
-    # Daily trend (parse dates)
-    df['parsed_date'] = pd.to_datetime(df['date'], format='%d/%m/%Y', errors='coerce')
-    daily_trend = df.groupby(df['parsed_date'].dt.strftime('%Y-%m-%d'))['revenue'].sum().to_dict()
-    
-    # Generate LLM insights with strict system prompt
-    llm_prompt = f"""You are a professional sales analyst. Analyze this Qatar sales report data and provide EXACTLY 4 concise, actionable business insights.
-
-STRICT RULES:
-1. DO NOT make up numbers - only use the data provided
-2. DO NOT repeat the summary statistics
-3. Focus on actionable insights and recommendations
-4. Be specific and data-driven
-5. Each insight must be 1-2 sentences maximum
-
-Data Summary:
-- Total Sales: QAR {total_sales:,.0f}
-- Net Profit (after deductions): QAR {total_profit:,.0f}
-- Deductions Breakdown:
-  - Delivery Charges: QAR {delivery_charge:,.0f}
-  - Refunds: QAR {refund_amount:,.0f}
-  - Returns: QAR {return_amount:,.0f}
-  - Cancelled: QAR {cancel_amount:,.0f}
-  - Pending: QAR {pending_amount:,.0f}
-- Total Orders: {total_orders}
-- Average Order Value: QAR {avg_order_value:,.0f}
-- Cancelled Orders Count: {cancelled_orders}
-
-Top 5 Products by Revenue: {list(top_products_revenue.keys())[:5]}
-Top 3 Areas: {list(area_performance.keys())[:3]}
-Order Status Distribution: {status_counts}
-
-Provide 4 bullet point insights starting with emojis (📈, ⚠️, 🗺️, 💡):
-"""
-    
-    llm_insights = await analyze_with_llm(llm_prompt)
-    
-    # Convert biggest_orders revenue to int
-    for order in biggest_orders:
-        order['revenue'] = int(order['revenue'])
+    # Generate AI insights
+    llm_insights = await generate_insights_with_llm(
+        summary_data,
+        total_orders,
+        list(top_products.keys()),
+        list(area_performance.keys())
+    )
     
     return {
         "summary": {
@@ -382,15 +379,63 @@ Provide 4 bullet point insights starting with emojis (📈, ⚠️, 🗺️, �
             "cancelled_orders": cancelled_orders
         },
         "biggest_orders": biggest_orders,
-        "top_customers": {k: int(v) for k, v in top_customers.items()},
-        "top_products": top_products_count,
-        "top_products_revenue": {k: int(v) for k, v in top_products_revenue.items()},
+        "top_customers": top_customers,
+        "top_products": top_products,
+        "top_products_revenue": top_products_revenue,
         "payment_methods": status_counts,
-        "area_performance": {k: int(v) for k, v in area_performance.items()},
-        "daily_trend": {k: int(v) for k, v in daily_trend.items() if k != 'NaT'},
+        "area_performance": area_performance,
+        "daily_trend": daily_trend,
         "llm_insights": llm_insights,
-        "raw_data": df[['date', 'order_no', 'customer_no', 'area', 'product', 'unit_price', 'payment', 'status']].head(100).to_dict('records')
+        "raw_data": orders[:100] if orders else []
     }
+
+
+def extract_orders_fallback(pdf_content: bytes) -> List[Dict[str, Any]]:
+    """Fallback regex-based order extraction"""
+    orders = []
+    
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            
+            for table in tables:
+                if not table:
+                    continue
+                    
+                for row in table:
+                    if not row or len(row) < 4:
+                        continue
+                    
+                    # Check if first column looks like a date
+                    date_val = str(row[0] or '').strip()
+                    if not re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', date_val):
+                        continue
+                    
+                    order = {
+                        'date': date_val,
+                        'order_no': str(row[1] or '').strip() if len(row) > 1 else '',
+                        'area': str(row[2] or '').strip() if len(row) > 2 else '',
+                        'customer_no': str(row[3] or '').strip() if len(row) > 3 else '',
+                        'product': str(row[4] or '').strip() if len(row) > 4 else '',
+                        'unit_price': parse_price(str(row[5] or '')) if len(row) > 5 else 0,
+                        'status': str(row[-1] or '').strip() if row else ''
+                    }
+                    orders.append(order)
+    
+    return orders
+
+
+def parse_price(value: str) -> float:
+    """Parse price string to float"""
+    if not value:
+        return 0
+    # Remove currency symbols and spaces
+    cleaned = re.sub(r'[^\d.,]', '', value)
+    cleaned = cleaned.replace(',', '')
+    try:
+        return float(cleaned) if cleaned else 0
+    except:
+        return 0
 
 
 if __name__ == "__main__":
