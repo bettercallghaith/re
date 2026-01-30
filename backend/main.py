@@ -160,11 +160,15 @@ def parse_currency(value: str) -> float:
     """Parse currency string to float"""
     if not value:
         return 0.0
-    # Remove currency symbols and commas
+    # Remove currency symbols and whitespace
     cleaned = re.sub(r'[^\d.,\-]', '', str(value))
+    # Remove commas (thousands separator)
     cleaned = cleaned.replace(',', '')
+    # Handle .000 at the end (strip trailing zeros after decimal)
     try:
-        return float(cleaned) if cleaned else 0.0
+        result = float(cleaned) if cleaned else 0.0
+        # If value has decimal that ends in zeros, it's the actual decimal value
+        return result
     except ValueError:
         return 0.0
 
@@ -199,11 +203,10 @@ async def analyze_sales(file: UploadFile = File(...)):
     # Parse numeric columns
     df['unit_price_num'] = df['unit_price'].apply(parse_currency)
     df['payment_num'] = df['payment'].apply(parse_currency)
-    df['quantity_num'] = pd.to_numeric(df['quantity'].str.extract(r'(\d+)', expand=False), errors='coerce').fillna(1)
     
-    # Calculate revenue (use payment if available, else unit_price * quantity)
+    # Calculate revenue - use payment if available, else unit_price (PDF shows total per line, not unit price)
     df['revenue'] = df.apply(
-        lambda r: r['payment_num'] if r['payment_num'] > 0 else r['unit_price_num'] * r['quantity_num'],
+        lambda r: r['payment_num'] if r['payment_num'] > 0 else r['unit_price_num'],
         axis=1
     )
     
@@ -213,8 +216,8 @@ async def analyze_sales(file: UploadFile = File(...)):
     avg_order_value = total_sales / total_orders if total_orders > 0 else 0
     
     # Calculate charges (assuming charges are in a separate column or calculated as % of sales)
-    # If no explicit charges column, estimate as 5% of revenue for now
-    df['charges'] = df['revenue'] * 0.05  # Placeholder - adjust based on actual PDF data
+    # TODO: Extract actual DELIVERY CHARGE from PDF summary if available
+    df['charges'] = df['revenue'] * 0.05  # Placeholder - 5% estimate
     total_charges = df['charges'].sum()
     
     # Calculate profit (revenue - charges)
