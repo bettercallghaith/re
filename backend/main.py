@@ -104,9 +104,17 @@ def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
         'cancel': 'cancel'
     }
     
+    def process_pair(label_text: str, value_text: str):
+        label_lower = label_text.lower().strip()
+        for keyword, key in keywords_map.items():
+            if keyword in label_lower:
+                val = extract_number_from_text(value_text)
+                if val > 0:
+                    summary[key] = val
+
     with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
         for page in pdf.pages:
-            # 1. Check plain text lines
+            # 1. Check plain text lines (often best for Summary box)
             text = page.extract_text() or ''
             lines = text.split('\n')
             for line in lines:
@@ -117,21 +125,33 @@ def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
                         if val > 0:
                             summary[key] = val
                             
-            # 2. Check tables (often clearer)
+            # 2. Check tables (carefully)
             tables = page.extract_tables()
             for table in tables:
                 if not table: continue
                 for row in table:
                     if not row or len(row) < 2: continue
-                    # row[0] usually label, row[1] usually value
-                    label = str(row[0] or '').lower().strip()
-                    val_text = str(row[1] or '').strip()
                     
-                    for keyword, key in keywords_map.items():
-                        if keyword in label:
-                            val = extract_number_from_text(val_text)
-                            if val > 0:
-                                summary[key] = val
+                    label_cell = str(row[0] or '').strip()
+                    value_cell = str(row[1] or '').strip()
+                    
+                    # Split multiline cells (Fixes merged cell bug)
+                    labels = label_cell.split('\n')
+                    values = value_cell.split('\n')
+                    
+                    # Only process if lines align, or strict 1-to-1
+                    if len(labels) == len(values) and len(labels) > 1:
+                        for l, v in zip(labels, values):
+                            process_pair(l, v)
+                    elif len(labels) == 1:
+                        # Simple row
+                        process_pair(label_cell, value_cell)
+                    else:
+                        # Mismatch or merged label with single value? 
+                        # DANGER: Do not assume single value applies to all labels.
+                        # Try to see if value_cell has newlines that were lost or if it's just one block
+                        # If label has multiple lines, better to trust text extraction for this part.
+                        pass
                                 
     return summary
 
