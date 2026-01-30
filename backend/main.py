@@ -268,25 +268,29 @@ Provide actionable insights in bullet points. Be specific and data-driven.
     
     llm_insights = await analyze_with_llm(llm_prompt)
     
+    # Convert biggest_orders revenue to int
+    for order in biggest_orders:
+        order['revenue'] = int(order['revenue'])
+    
     return {
         "summary": {
-            "total_sales": round(total_sales, 2),
-            "total_profit": round(total_profit, 2),
-            "total_charges": round(total_charges, 2),
+            "total_sales": int(total_sales),
+            "total_profit": int(total_profit),
+            "total_charges": int(total_charges),
             "profit_margin": round(profit_margin, 1),
             "total_orders": total_orders,
-            "avg_order_value": round(avg_order_value, 2),
+            "avg_order_value": int(avg_order_value),
             "successful_orders": successful,
             "cancelled_orders": cancelled,
             "success_rate": round((successful / total_orders) * 100, 1) if total_orders > 0 else 0
         },
         "biggest_orders": biggest_orders,
-        "top_customers": {k: round(v, 2) for k, v in top_customers.items()},
+        "top_customers": {k: int(v) for k, v in top_customers.items()},
         "top_products": top_products_count,
-        "top_products_revenue": {k: round(v, 2) for k, v in top_products_revenue.items()},
+        "top_products_revenue": {k: int(v) for k, v in top_products_revenue.items()},
         "payment_methods": status_counts,
-        "area_performance": {k: round(v, 2) for k, v in area_performance.items()},
-        "daily_trend": {k: round(v, 2) for k, v in daily_trend.items() if k != 'NaT'},
+        "area_performance": {k: int(v) for k, v in area_performance.items()},
+        "daily_trend": {k: int(v) for k, v in daily_trend.items() if k != 'NaT'},
         "llm_insights": llm_insights,
         "raw_data": df[['date', 'order_no', 'customer_no', 'area', 'product', 'unit_price', 'payment', 'status']].head(100).to_dict('records')
     }
