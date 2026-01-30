@@ -108,7 +108,24 @@ def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
         'cancel': 'cancel'
     }
     
+    def extract_number_from_text(text: str) -> float:
+        """Extract a clean number from text, handling commas and decimals"""
+        # Find all number patterns (handles 1,150.00 format)
+        # Pattern matches: optional digits, optional comma+digits groups, optional decimal
+        matches = re.findall(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)', text)
+        if matches:
+            # Take the last match (usually the value on the right side)
+            value_str = matches[-1]
+            # Remove commas and convert to float
+            cleaned = value_str.replace(',', '')
+            try:
+                return float(cleaned)
+            except:
+                return 0.0
+        return 0.0
+    
     with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        # Process ALL pages
         for page in pdf.pages:
             text = page.extract_text() or ''
             lines = text.split('\n')
@@ -117,17 +134,11 @@ def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
                 line_lower = line.lower().strip()
                 for keyword, key in keywords_map.items():
                     if keyword in line_lower:
-                        # Extract number from line
-                        numbers = re.findall(r'[\d,]+\.?\d*', line)
-                        if numbers:
-                            # Take the last number (usually the value)
-                            value_str = numbers[-1].replace(',', '')
-                            try:
-                                summary[key] = float(value_str)
-                            except:
-                                pass
+                        value = extract_number_from_text(line)
+                        if value > 0:
+                            summary[key] = value
             
-            # Also try extracting from tables
+            # Also try extracting from tables (more reliable)
             tables = page.extract_tables()
             for table in tables:
                 if not table:
@@ -138,11 +149,11 @@ def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
                     cell_text = str(row[0] or '').lower().strip()
                     for keyword, key in keywords_map.items():
                         if keyword in cell_text:
-                            value_str = str(row[1] or '').replace(',', '').replace('QAR', '').strip()
-                            try:
-                                summary[key] = float(value_str)
-                            except:
-                                pass
+                            # Get value from second column
+                            value_text = str(row[1] or '')
+                            value = extract_number_from_text(value_text)
+                            if value > 0:
+                                summary[key] = value
     
     return summary
 
