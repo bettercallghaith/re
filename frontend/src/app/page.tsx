@@ -22,13 +22,16 @@ interface AnalysisData {
     summary: {
         total_sales: number
         total_profit: number
-        total_charges: number
+        delivery_charge: number
+        refund_amount: number
+        return_amount: number
+        cancel_amount: number
+        pending_amount: number
         profit_margin: number
         total_orders: number
         avg_order_value: number
         successful_orders: number
         cancelled_orders: number
-        success_rate: number
     }
     biggest_orders: BiggestOrder[]
     top_customers: Record<string, number>
@@ -296,9 +299,9 @@ export default function Dashboard() {
                             <span className="stat-change positive">{analysis.summary.profit_margin}% margin</span>
                         </div>
                         <div className="card stat-card animate-in delay-3">
-                            <span className="stat-label">Charges</span>
+                            <span className="stat-label">Delivery Charge</span>
                             <span className="stat-value charges">
-                                <AnimatedNumber value={analysis.summary.total_charges} prefix="QAR " />
+                                <AnimatedNumber value={analysis.summary.delivery_charge} prefix="QAR " />
                             </span>
                         </div>
                         <div className="card stat-card animate-in delay-4">
@@ -314,12 +317,12 @@ export default function Dashboard() {
                             </span>
                         </div>
                         <div className="card stat-card animate-in delay-6">
-                            <span className="stat-label">Success Rate</span>
-                            <span className="stat-value">
-                                <AnimatedNumber value={analysis.summary.success_rate} suffix="%" />
+                            <span className="stat-label">Cancelled</span>
+                            <span className="stat-value charges">
+                                <AnimatedNumber value={analysis.summary.cancel_amount} prefix="QAR " />
                             </span>
                             {analysis.summary.cancelled_orders > 0 && (
-                                <span className="stat-change negative">{analysis.summary.cancelled_orders} cancelled</span>
+                                <span className="stat-change negative">{analysis.summary.cancelled_orders} orders</span>
                             )}
                         </div>
                     </div>

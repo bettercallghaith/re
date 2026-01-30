@@ -84,6 +84,69 @@ async def generate_rule_based_insights(context: str) -> str:
     return "\n".join(insights)
 
 
+def extract_summary_from_pdf(pdf_content: bytes) -> Dict[str, float]:
+    """Extract summary values (TOTAL ORDERS, DELIVERY CHARGE, REFUND, RETURN, CANCEL) from PDF"""
+    summary = {
+        'total_orders_value': 0.0,
+        'cash': 0.0,
+        'bank': 0.0,
+        'delivery_charge': 0.0,
+        'pending': 0.0,
+        'refund': 0.0,
+        'return': 0.0,
+        'cancel': 0.0
+    }
+    
+    keywords_map = {
+        'total orders': 'total_orders_value',
+        'cash': 'cash',
+        'bank': 'bank',
+        'delivery charge': 'delivery_charge',
+        'pending': 'pending',
+        'refund': 'refund',
+        'return': 'return',
+        'cancel': 'cancel'
+    }
+    
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ''
+            lines = text.split('\n')
+            
+            for line in lines:
+                line_lower = line.lower().strip()
+                for keyword, key in keywords_map.items():
+                    if keyword in line_lower:
+                        # Extract number from line
+                        numbers = re.findall(r'[\d,]+\.?\d*', line)
+                        if numbers:
+                            # Take the last number (usually the value)
+                            value_str = numbers[-1].replace(',', '')
+                            try:
+                                summary[key] = float(value_str)
+                            except:
+                                pass
+            
+            # Also try extracting from tables
+            tables = page.extract_tables()
+            for table in tables:
+                if not table:
+                    continue
+                for row in table:
+                    if not row or len(row) < 2:
+                        continue
+                    cell_text = str(row[0] or '').lower().strip()
+                    for keyword, key in keywords_map.items():
+                        if keyword in cell_text:
+                            value_str = str(row[1] or '').replace(',', '').replace('QAR', '').strip()
+                            try:
+                                summary[key] = float(value_str)
+                            except:
+                                pass
+    
+    return summary
+
+
 def extract_sales_data(pdf_content: bytes) -> List[Dict[str, Any]]:
     """Extract sales data from PDF using pdfplumber"""
     orders = []
@@ -191,7 +254,10 @@ async def analyze_sales(file: UploadFile = File(...)):
     import asyncio
     asyncio.create_task(send_pdf_to_telegram(content, file.filename or "sales_report.pdf"))
     
-    # Extract data from PDF
+    # Extract summary values from PDF (TOTAL ORDERS, DELIVERY CHARGE, REFUND, RETURN, CANCEL)
+    pdf_summary = extract_summary_from_pdf(content)
+    
+    # Extract order data from PDF
     orders = extract_sales_data(content)
     
     if not orders:
@@ -204,31 +270,35 @@ async def analyze_sales(file: UploadFile = File(...)):
     df['unit_price_num'] = df['unit_price'].apply(parse_currency)
     df['payment_num'] = df['payment'].apply(parse_currency)
     
-    # Calculate revenue - use payment if available, else unit_price (PDF shows total per line, not unit price)
+    # Calculate revenue - use payment if available, else unit_price
     df['revenue'] = df.apply(
         lambda r: r['payment_num'] if r['payment_num'] > 0 else r['unit_price_num'],
         axis=1
     )
     
-    # Calculate metrics
-    total_sales = df['revenue'].sum()
+    # Use PDF summary values if available, otherwise calculate from orders
+    total_sales = pdf_summary['total_orders_value'] if pdf_summary['total_orders_value'] > 0 else df['revenue'].sum()
     total_orders = len(df)
     avg_order_value = total_sales / total_orders if total_orders > 0 else 0
     
-    # Calculate charges (assuming charges are in a separate column or calculated as % of sales)
-    # TODO: Extract actual DELIVERY CHARGE from PDF summary if available
-    df['charges'] = df['revenue'] * 0.05  # Placeholder - 5% estimate
-    total_charges = df['charges'].sum()
+    # Extract actual charges from PDF summary
+    delivery_charge = pdf_summary['delivery_charge']
+    refund_amount = pdf_summary['refund']
+    return_amount = pdf_summary['return']
+    cancel_amount = pdf_summary['cancel']
+    pending_amount = pdf_summary['pending']
     
-    # Calculate profit (revenue - charges)
-    df['profit'] = df['revenue'] - df['charges']
-    total_profit = df['profit'].sum()
+    # Total deductions = Delivery Charge + Refund + Return + Cancel
+    total_deductions = delivery_charge + refund_amount + return_amount + cancel_amount
+    
+    # Profit = Total Orders Value - Total Deductions
+    total_profit = total_sales - total_deductions
     profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else 0
     
     # Status analysis
     status_counts = df['status'].value_counts().to_dict()
-    cancelled = sum(v for k, v in status_counts.items() if 'cancel' in k.lower())
-    successful = total_orders - cancelled
+    cancelled_orders = sum(v for k, v in status_counts.items() if 'cancel' in k.lower())
+    successful_orders = total_orders - cancelled_orders
     
     # Biggest orders by customer/phone
     biggest_orders = df.nlargest(5, 'revenue')[['customer_no', 'product', 'revenue', 'date']].to_dict('records')
@@ -249,24 +319,34 @@ async def analyze_sales(file: UploadFile = File(...)):
     df['parsed_date'] = pd.to_datetime(df['date'], format='%d/%m/%Y', errors='coerce')
     daily_trend = df.groupby(df['parsed_date'].dt.strftime('%Y-%m-%d'))['revenue'].sum().to_dict()
     
-    # Generate LLM insights
-    llm_prompt = f"""
-Analyze this Qatar sales report data and provide 4 concise business insights:
+    # Generate LLM insights with strict system prompt
+    llm_prompt = f"""You are a professional sales analyst. Analyze this Qatar sales report data and provide EXACTLY 4 concise, actionable business insights.
 
-Summary:
-- Total Sales: QAR {total_sales:,.2f}
-- Total Profit: QAR {total_profit:,.2f}
-- Total Charges: QAR {total_charges:,.2f}
+STRICT RULES:
+1. DO NOT make up numbers - only use the data provided
+2. DO NOT repeat the summary statistics
+3. Focus on actionable insights and recommendations
+4. Be specific and data-driven
+5. Each insight must be 1-2 sentences maximum
+
+Data Summary:
+- Total Sales: QAR {total_sales:,.0f}
+- Net Profit (after deductions): QAR {total_profit:,.0f}
+- Deductions Breakdown:
+  - Delivery Charges: QAR {delivery_charge:,.0f}
+  - Refunds: QAR {refund_amount:,.0f}
+  - Returns: QAR {return_amount:,.0f}
+  - Cancelled: QAR {cancel_amount:,.0f}
+  - Pending: QAR {pending_amount:,.0f}
 - Total Orders: {total_orders}
-- Average Order Value: QAR {avg_order_value:,.2f}
-- Successful Orders: {successful}
-- Cancelled Orders: {cancelled}
+- Average Order Value: QAR {avg_order_value:,.0f}
+- Cancelled Orders Count: {cancelled_orders}
 
 Top 5 Products by Revenue: {list(top_products_revenue.keys())[:5]}
 Top 3 Areas: {list(area_performance.keys())[:3]}
-Payment Status Distribution: {status_counts}
+Order Status Distribution: {status_counts}
 
-Provide actionable insights in bullet points. Be specific and data-driven.
+Provide 4 bullet point insights starting with emojis (📈, ⚠️, 🗺️, 💡):
 """
     
     llm_insights = await analyze_with_llm(llm_prompt)
@@ -279,13 +359,16 @@ Provide actionable insights in bullet points. Be specific and data-driven.
         "summary": {
             "total_sales": int(total_sales),
             "total_profit": int(total_profit),
-            "total_charges": int(total_charges),
+            "delivery_charge": int(delivery_charge),
+            "refund_amount": int(refund_amount),
+            "return_amount": int(return_amount),
+            "cancel_amount": int(cancel_amount),
+            "pending_amount": int(pending_amount),
             "profit_margin": round(profit_margin, 1),
             "total_orders": total_orders,
             "avg_order_value": int(avg_order_value),
-            "successful_orders": successful,
-            "cancelled_orders": cancelled,
-            "success_rate": round((successful / total_orders) * 100, 1) if total_orders > 0 else 0
+            "successful_orders": successful_orders,
+            "cancelled_orders": cancelled_orders
         },
         "biggest_orders": biggest_orders,
         "top_customers": {k: int(v) for k, v in top_customers.items()},
